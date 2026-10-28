@@ -291,7 +291,7 @@ sub-package one of two ways:</p>
 <code>WithSigV4</code> / <code>WithSigV4RegionSvc</code> or the <code>rest.sigv4-enabled</code> property. The
 backend signs with the <code>s3.*</code> credential properties when set (falling back to
 the <code>rest.*</code> aliases), otherwise with the AWS default credential chain.</li>
-<li>Explicit config: pass <code>sigv4.WithAwsConfig(cfg)</code> to <code>NewCatalog</code> alongside
+<li>Explicit config: pass <code>sigv4.WithAWSConfig(cfg)</code> to <code>NewCatalog</code> alongside
 <code>WithSigV4</code> / <code>WithSigV4RegionSvc</code> (no blank import needed). It supplies the
 <code>aws.Config</code>; the signing service comes from those options (or a server
 <code>/v1/config</code> override), and so does the region when one is set. Otherwise
@@ -346,8 +346,8 @@ assume parity on it in multi-client deployments.</p>
 <h3 id="glue-catalogglue"><a class="header" href="#glue-catalogglue">Glue (<code>catalog/glue</code>)</a></h3>
 <p>Source: <a href="https://github.com/apache/iceberg-go/blob/main/catalog/glue/options.go"><code>catalog/glue/options.go</code></a>.</p>
 <ul>
-<li><code>WithAwsConfig(cfg aws.Config)</code> - AWS SDK v2 config; respects the AWS default credential chain.</li>
-<li><code>WithAwsProperties(props AwsProperties)</code> - explicit overrides for region/endpoint/access keys.</li>
+<li><code>WithAWSConfig(cfg aws.Config)</code> - AWS SDK v2 config; respects the AWS default credential chain.</li>
+<li><code>WithAWSProperties(props AWSProperties)</code> - catalog properties, such as <code>glue.id</code> and the <code>s3.*</code> FileIO keys. <code>NewCatalog</code> ignores the <code>glue.region</code>, endpoint, credential, and retry keys; only <code>catalog.Load</code> reads them.</li>
 </ul>
 <h3 id="sql-catalogsql"><a class="header" href="#sql-catalogsql">SQL (<code>catalog/sql</code>)</a></h3>
 <p>The SQL catalog has no functional-option surface. Construct it with <code>NewCatalog</code>:</p>
@@ -467,7 +467,7 @@ selected.</p>
 <h2 id="pluggability"><a class="header" href="#pluggability">Pluggability</a></h2>
 <p>Two registries are user-extensible. The third (LocationProvider) is currently informational.</p>
 <h3 id="io-scheme-registry"><a class="header" href="#io-scheme-registry">IO scheme registry</a></h3>
-<p>Register a custom URL scheme with <a href="https://github.com/apache/iceberg-go/blob/main/io/registry.go"><code>io.Register</code></a>:</p>
+<p>Register a custom URL scheme from an <code>init</code> function with <a href="https://github.com/apache/iceberg-go/blob/main/io/registry.go"><code>io.MustRegister</code></a>:</p>
 <pre><code class="language-go">import (
     &quot;context&quot;
     &quot;net/url&quot;
@@ -476,14 +476,22 @@ selected.</p>
 )
 
 func init() {
-    io.Register(&quot;myfs&quot;, func(ctx context.Context, parsed *url.URL, props map[string]string) (io.IO, error) {
+    io.MustRegister(&quot;myfs&quot;, func(ctx context.Context, parsed *url.URL, props map[string]string) (io.IO, error) {
         return newMyFS(parsed, props)
     })
 }
 </code></pre>
-<p><code>io.Register</code> panics on <code>nil</code> factory or duplicate scheme. Built-in schemes: <code>file</code>, <code>&quot;&quot;</code> (the empty scheme).
+<p><code>io.Register</code> and <code>io.MustRegister</code> both panic for invalid or duplicate global schemes, preserving the existing registration contract. <code>registry.Register</code> on an independent registry returns <code>ErrInvalidSchemeFactory</code> or <code>ErrSchemeAlreadyRegistered</code> instead. Built-in schemes: <code>file</code>, <code>&quot;&quot;</code> (the empty scheme).
 Cloud schemes (<code>s3</code>, <code>gs</code>, <code>abfs</code>, etc.) are registered only when the matching backend package under <code>io/gocloud</code> is blank-imported.</p>
 <p><code>io.GetRegisteredSchemes()</code> returns the current scheme list; <code>io.Unregister(scheme)</code> removes one.</p>
+<p>To register schemes at runtime without changing other users of the same process, create an independent registry (catalogs and <code>view.CreateView</code> still resolve through the default registry):</p>
+<pre><code class="language-go">registry := io.NewRegistry()
+if err := registry.Register(&quot;myfs&quot;, myFactory); err != nil {
+    return err
+}
+fs, err := registry.LoadFS(ctx, props, &quot;myfs://bucket/key&quot;)
+</code></pre>
+<p><code>io.NewRegistry()</code> copies schemes already registered globally (including blank-imported cloud backends) but keeps later registrations independent. <code>registry.Clone()</code> makes an isolated copy of another registry. <code>registry.Names()</code> lists the schemes registered in that instance. <code>registry.LoadFSFunc()</code> is the lazy factory equivalent. Global <code>io.LoadFS()</code> and <code>io.LoadFSFunc()</code> continue using the default registry.</p>
 <h3 id="catalog-type-registry"><a class="header" href="#catalog-type-registry">Catalog type registry</a></h3>
 <p>Register a custom catalog type with <a href="https://github.com/apache/iceberg-go/blob/main/catalog/registry.go"><code>catalog.Register</code></a>:</p>
 <pre><code class="language-go">import (
@@ -501,7 +509,7 @@ func init() {
     ))
 }
 </code></pre>
-<p>After registration, <code>catalog.Load(ctx, &quot;default&quot;, iceberg.Properties{&quot;type&quot;: &quot;mycatalog&quot;, ...})</code> will route to the factory. Built-in types: <code>rest</code>, <code>hive</code>, <code>glue</code>, <code>sql</code>, <code>hadoop</code>.</p>
+<p>After registration, <code>catalog.Load(ctx, &quot;default&quot;, iceberg.Properties{&quot;type&quot;: &quot;mycatalog&quot;, ...})</code> will route to the factory. Custom catalogs must implement <code>Close() error</code> to satisfy <code>catalog.Catalog</code>, and callers must close them when finished. Built-in types: <code>rest</code>, <code>hive</code>, <code>glue</code>, <code>sql</code>, <code>hadoop</code>.</p>
 <p><code>catalog.GetRegisteredCatalogs()</code> returns the current list; <code>catalog.Unregister(catalogType)</code> removes one.</p>
 <h3 id="locationprovider"><a class="header" href="#locationprovider">LocationProvider</a></h3>
 <p><a href="https://github.com/apache/iceberg-go/blob/main/table/locations.go"><code>table/locations.go</code></a> defines the <code>LocationProvider</code> interface and ships two implementations: <code>simpleLocationProvider</code> (default) and <code>objectStoreLocationProvider</code> (selected by <code>write.object-storage.enabled = true</code>). The provider is chosen by table properties and is not user-pluggable today.</p>
@@ -517,13 +525,34 @@ func init() {
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Default</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>read.split.target-size</code></td><td><code>134217728</code></td><td>Target size for coalescing safe row-group ranges when splitting large local Parquet files. A range may exceed the target when no supplied offset can divide it safely.</td></tr>
 <tr><td><code>read.manifest-list-cache.enabled</code></td><td><code>true</code></td><td>Reuse decoded snapshot manifest lists across scans of a table handle. Set to <code>false</code> to disable retention and shared in-flight reads. Applied when loading or refreshing a table, and when creating a transaction scan.</td></tr>
+<tr><td><code>io.manifest.cache-enabled</code></td><td><code>false</code></td><td>Reuse raw manifest file content across local scans. Read from catalog FileIO properties in REST, Glue, SQL, Hive and Hadoop; REST table metadata and load-response config may override the catalog value.</td></tr>
+<tr><td><code>io.manifest.cache.expiration-interval-ms</code></td><td><code>60000</code></td><td>Idle expiration in milliseconds. Zero disables time-based expiration; negative or unparsable values warn and disable the cache. Expired entries are reclaimed on cache access/insertion, without a background cleanup task.</td></tr>
+<tr><td><code>io.manifest.cache.max-total-bytes</code></td><td><code>104857600</code></td><td>Retained raw bytes per independently loaded table. Handles returned by commit share their source table's cache and budget. Concurrent population buffers and bytes held by active readers are not counted. Non-positive or unparsable values warn and disable caching.</td></tr>
+<tr><td><code>io.manifest.cache.max-content-length</code></td><td><code>8388608</code></td><td>Maximum size of one manifest eligible for content caching. Non-positive or unparsable values warn and disable caching.</td></tr>
 </tbody></table>
 </div>
+<p>The catalog's FileIO properties configure manifest caching for all built-in
+catalogs. With direct <code>table.New</code> calls, use <code>WithScanPlanningIOProperties</code>
+or <code>WithSavedConfig</code>; saved config wins when the same key is present in both.
+Matching expiration interval, total byte limit and per-manifest byte limit
+preserve warm cache entries across refresh and commit. Changing a limit replaces
+the cache.</p>
+<p>Unlike Java, which rejects invalid manifest-cache limits, Go warns and disables
+the content cache for negative or unparsable expiration or
+non-positive/unparsable size limits.</p>
 <p>The manifest-list cache retains at most 64 snapshots and 32,768 manifest
 descriptors in total per table handle. These are count limits, not byte limits:
 memory use also depends on manifest paths, partition summaries, and key metadata.
-Refreshing the table replaces its cache. This caches decoded manifest lists;
-it does not implement Java's <code>io.manifest.cache.*</code> file-content cache settings.</p>
+Refreshing the table replaces its manifest-list cache.</p>
+<p>The optional manifest-content cache is separate. It stores immutable raw manifest
+bytes and still decodes, projects, and filters entries independently for each
+scan. Cache misses for the same manifest share one in-flight read. If population
+fails, its producer and each existing waiter independently fall back to one
+ordinary FileIO open; if the producer was canceled, live waiters can start
+another shared load. Failed content is not
+retained, so a later scan can retry. Manifests larger than the configured
+per-file limit bypass the cache. The current integration covers local scan
+planning; manifest lists continue to use the decoded manifest-list cache.</p>
 <p>The Java-compatible <code>read.split.planning-lookback</code> and <code>read.split.open-file-cost</code>
 names and defaults are also exported by the Go API for shared configuration,
 but are reserved for future task-group planning and are not currently read.</p>

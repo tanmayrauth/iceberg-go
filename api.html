@@ -271,7 +271,7 @@ cat, err := sqlcat.NewCatalog(&quot;default&quot;, db, sqlcat.SQLite, iceberg.Pr
 
 awsCfg, err := config.LoadDefaultConfig(context.TODO())
 // handle err
-cat := glue.NewCatalog(glue.WithAwsConfig(awsCfg))
+cat := glue.NewCatalog(glue.WithAWSConfig(awsCfg))
 </code></pre>
 <h4 id="hive"><a class="header" href="#hive">Hive</a></h4>
 <pre><code class="language-go">import (
@@ -287,9 +287,10 @@ cat, err := hive.NewCatalog(iceberg.Properties{},
 <pre><code class="language-go">import (
     &quot;github.com/apache/iceberg-go&quot;
     &quot;github.com/apache/iceberg-go/catalog/hadoop&quot;
+    &quot;context&quot;
 )
 
-cat, err := hadoop.NewCatalog(&quot;default&quot;, &quot;file:///tmp/warehouse&quot;, iceberg.Properties{})
+cat, err := hadoop.NewCatalog(context.Background(), &quot;default&quot;, &quot;file:///tmp/warehouse&quot;, iceberg.Properties{})
 </code></pre>
 <h4 id="via-the-registry"><a class="header" href="#via-the-registry">Via the registry</a></h4>
 <p><code>catalog.Load</code> looks up the right backend via the <code>type</code> property (or <code>uri</code> scheme as a fallback) plus your <code>~/.iceberg-go.yaml</code>. Useful when you want runtime selection:</p>
@@ -303,7 +304,11 @@ cat, err := catalog.Load(ctx, &quot;default&quot;, iceberg.Properties{
     &quot;uri&quot;:       &quot;http://localhost:8181&quot;,
     &quot;warehouse&quot;: &quot;s3://my-bucket/warehouse&quot;,
 })
+if err != nil { panic(err) }
+defer cat.Close()
 </code></pre>
+<p>Every catalog implements <code>Close() error</code>. Close it when done to release catalog-owned
+resources. A caller-supplied database connection remains caller-owned.</p>
 <h3 id="namespaces"><a class="header" href="#namespaces">Namespaces</a></h3>
 <pre><code class="language-go">ns := table.Identifier{&quot;sales&quot;}
 
@@ -480,7 +485,7 @@ newTbl, err = tbl.Overwrite(ctx, recordReader, nil,
 <h3 id="add-existing-files"><a class="header" href="#add-existing-files">Add existing files</a></h3>
 <p>When you already have data files (e.g. produced by another writer), register them without rewriting:</p>
 <pre><code class="language-go">txn := tbl.NewTransaction()
-err := txn.AddFiles(ctx, []string{
+err := txn.AddDataFilesByPath(ctx, []string{
     &quot;s3://my-bucket/sales/orders/data/file-1.parquet&quot;,
     &quot;s3://my-bucket/sales/orders/data/file-2.parquet&quot;,
 }, nil /* snapshot props */, false /* ignoreDuplicates */)
@@ -488,7 +493,7 @@ if err != nil { /* ... */ }
 
 newTbl, err := txn.Commit(ctx)
 </code></pre>
-<p><code>ReplaceDataFiles(ctx, filesToDelete, filesToAdd, snapshotProps)</code> and <code>ReplaceDataFilesWithDataFiles(ctx, filesToDelete, dataFilesToAdd, snapshotProps, opts...)</code> are also available on <code>*Transaction</code> for swapping files atomically.</p>
+<p><code>ReplaceDataFilesByPath(ctx, filesToDelete, filesToAdd, snapshotProps)</code> and <code>ReplaceDataFiles(ctx, filesToDelete, dataFilesToAdd, snapshotProps, opts...)</code> are also available on <code>*Transaction</code> for swapping files atomically.</p>
 <h3 id="transactions"><a class="header" href="#transactions">Transactions</a></h3>
 <p>Group writes and metadata changes into one atomic snapshot:</p>
 <pre><code class="language-go">txn := tbl.NewTransaction()
@@ -507,9 +512,10 @@ if err := txn.SetProperties(iceberg.Properties{&quot;commit.user&quot;: &quot;da
 newTbl, err := txn.Commit(ctx)
 </code></pre>
 <p>To target a specific branch:</p>
-<pre><code class="language-go">txn := tbl.NewTransactionOnBranch(&quot;staging&quot;)
+<pre><code class="language-go">txn, err := tbl.NewTransactionOnBranch(&quot;staging&quot;)
+if err != nil { /* ... */ }
 </code></pre>
-<p><code>Commit</code> retries automatically on conflict (<code>ErrCommitFailed</code>) - tune via the <code>commit.retry.*</code> table properties.</p>
+<p><code>Commit</code> can retry on conflict (<code>ErrCommitFailed</code>) when <code>commit.retry.num-retries</code> is set. See <a href="./concurrent-writes.html#automatic-retry">Automatic retry</a> for the <code>commit.retry.*</code> table properties.</p>
 <h2 id="schema-and-partition-evolution"><a class="header" href="#schema-and-partition-evolution">Schema and partition evolution</a></h2>
 <h3 id="schema-evolution"><a class="header" href="#schema-evolution">Schema evolution</a></h3>
 <pre><code class="language-go">import &quot;github.com/apache/iceberg-go/table&quot;
@@ -604,6 +610,7 @@ fmt.Printf(&quot;rewrote %d files into %d (%d -&gt; %d bytes)\n&quot;,
     result.RemovedDataFiles, result.AddedDataFiles, result.BytesBefore, result.BytesAfter)
 </code></pre>
 <p>The <code>table/compaction</code> subpackage provides bin-packing planning. The <code>iceberg compact analyze</code> and <code>compact run</code> CLI commands wrap the same machinery - see <a href="./cli.html">CLI</a>.</p>
+<p>Compaction tasks represent complete data files, not independent scan splits. The planner collapses split tasks for the same file into one whole-file task, rejecting inconsistent delete or lineage metadata and dropping residual filters because they select files but do not filter rows during compaction. Direct calls to <code>ExecuteCompactionGroup</code> reject partial ranges and residual row filters. Attached delete files are still applied when rewriting each source file.</p>
 <h3 id="expiring-snapshots"><a class="header" href="#expiring-snapshots">Expiring snapshots</a></h3>
 <pre><code class="language-go">import (
     &quot;time&quot;
@@ -631,7 +638,7 @@ v, err := view.CreateView(
     &quot;my-catalog&quot;,
     table.Identifier{&quot;analytics&quot;, &quot;monthly_orders&quot;},
     schema,
-    &quot;SELECT month, sum(amount) FROM orders GROUP BY month&quot;,
+    view.Representation{SQL: &quot;SELECT month, sum(amount) FROM orders GROUP BY month&quot;, Dialect: &quot;spark&quot;},
     table.Identifier{&quot;sales&quot;},                      // default namespace for unqualified names
     &quot;s3://my-bucket/views/monthly_orders&quot;,
     iceberg.Properties{},
